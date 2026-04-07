@@ -67,6 +67,8 @@ import org.apache.tomcat.util.threads.ThreadPoolExecutor;
 import org.apache.tomcat.util.threads.VirtualThreadExecutor;
 
 /**
+ * Abstract endpoint implementation.
+ *
  * @param <S> The type used by the socket wrapper associated with this endpoint. Might be the same as U.
  * @param <U> The type of the underlying socket used by this endpoint. Might be the same as S.
  */
@@ -256,6 +258,17 @@ public abstract class AbstractEndpoint<S, U> {
     }
 
 
+    private boolean strictSni = true;
+
+    public boolean getStrictSni() {
+        return strictSni;
+    }
+
+    public void setStrictSni(boolean strictSni) {
+        this.strictSni = strictSni;
+    }
+
+
     private String defaultSSLHostConfigName = SSLHostConfig.DEFAULT_SSL_HOST_NAME;
 
     /**
@@ -395,6 +408,12 @@ public abstract class AbstractEndpoint<S, U> {
      */
     protected void createSSLContext(SSLHostConfig sslHostConfig) throws IllegalArgumentException {
 
+        // Initialize group list
+        LinkedHashSet<Group> groupList = sslHostConfig.getGroupList();
+        if (groupList != null && getLog().isDebugEnabled()) {
+            getLog().debug(sm.getString("endpoint.tls.enabledGroups", groupList));
+        }
+
         boolean firstCertificate = true;
         for (SSLHostConfigCertificate certificate : sslHostConfig.getCertificates(true)) {
             SSLUtil sslUtil = sslImplementation.getSSLUtil(certificate);
@@ -443,8 +462,14 @@ public abstract class AbstractEndpoint<S, U> {
             if (keyAlias == null) {
                 keyAlias = SSLUtilBase.DEFAULT_KEY_ALIAS;
             }
-            certificateInfo =
-                    sm.getString("endpoint.tls.info.cert.keystore", certificate.getCertificateKeystoreFile(), keyAlias);
+            String keystoreFile;
+            if (certificate.getCertificateKeystoreInternal() != null) {
+                // Keystore was set directly. Original location is unknown.
+                keystoreFile = sm.getString("endpoint.tls.info.cert.keystore.direct");
+            } else {
+                keystoreFile = certificate.getCertificateKeystoreFile();
+            }
+            certificateInfo = sm.getString("endpoint.tls.info.cert.keystore", keystoreFile, keyAlias);
         }
 
         String trustStoreSource = sslHostConfig.getTruststoreFile();
@@ -702,6 +727,23 @@ public abstract class AbstractEndpoint<S, U> {
             throw new IllegalStateException();
         }
         return result;
+    }
+
+
+    /**
+     * Check if two host names share the same SSLHostConfig.
+     *
+     * @param sniHostName the host name from SNI, null if SNI is not in use
+     * @param protocolHostName the host name from the protocol
+     * @return true if SNI is not checked, if the SNI host name matches the protocol host name,
+     *    if both host names use the same SSLHostConfig configuration, if there is no SNI and the
+     *    protocol host name uses the default SSLHostConfig configuration, and false otherwise
+     */
+    public boolean checkSni(String sniHostName, String protocolHostName) {
+        return (!strictSni || !isSSLEnabled()
+                || (sniHostName != null && sniHostName.equalsIgnoreCase(protocolHostName))
+                || getSSLHostConfig(sniHostName) == getSSLHostConfig(
+                        protocolHostName != null ? protocolHostName.toLowerCase(Locale.ENGLISH) : null));
     }
 
 

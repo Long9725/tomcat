@@ -17,6 +17,7 @@
 package org.apache.tomcat.util.net.openssl.panama;
 
 import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.io.InputStream;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
@@ -86,14 +87,17 @@ public final class OpenSSLEngine extends SSLEngine implements SSLUtil.ProtocolIn
         final Set<String> availableCipherSuites = new LinkedHashSet<>(128);
         availableCipherSuites.addAll(OpenSSLLibrary.findCiphers("ALL"));
         AVAILABLE_CIPHER_SUITES = Collections.unmodifiableSet(availableCipherSuites);
-        IMPLEMENTED_PROTOCOLS_SET = Set.of(Constants.SSL_PROTO_SSLv2Hello, Constants.SSL_PROTO_SSLv2,
-                Constants.SSL_PROTO_SSLv3, Constants.SSL_PROTO_TLSv1, Constants.SSL_PROTO_TLSv1_1,
-                Constants.SSL_PROTO_TLSv1_2, Constants.SSL_PROTO_TLSv1_3);
+        IMPLEMENTED_PROTOCOLS_SET =
+                Set.of(Constants.SSL_PROTO_SSLv2Hello, Constants.SSL_PROTO_SSLv3, Constants.SSL_PROTO_TLSv1,
+                        Constants.SSL_PROTO_TLSv1_1, Constants.SSL_PROTO_TLSv1_2, Constants.SSL_PROTO_TLSv1_3);
     }
 
     private static final int MAX_PLAINTEXT_LENGTH = 16 * 1024; // 2^14
     private static final int MAX_COMPRESSED_LENGTH = MAX_PLAINTEXT_LENGTH + 1024;
     private static final int MAX_CIPHERTEXT_LENGTH = MAX_COMPRESSED_LENGTH + 1024;
+    // 15 minutes aligns with JSSE
+    private static final int OCSP_MAX_SKEW = 60 * 15;
+    private static final int OCSP_MAX_RESPONSE_SIZE = 64 * 1024;
 
     // Header (5) + Data (2^14) + Compression (1024) + Encryption (1024) + MAC (20) + Padding (256)
     private static final int MAX_ENCRYPTED_PACKET_LENGTH = MAX_CIPHERTEXT_LENGTH + 5 + 20 + 256;
@@ -174,10 +178,15 @@ public final class OpenSSLEngine extends SSLEngine implements SSLUtil.ProtocolIn
      *                                                verification from the {@code SSL_CTX} {@code sslCtx}
      * @param certificateVerificationDepth        Certificate verification depth
      * @param certificateVerificationOptionalNoCA Skip CA verification in optional mode
+     * @param noOcspCheck                         Enable OCSP if true
+     * @param ocspSoftFail                        Allow OCSP checks to pass if the responder can't be contacted
+     * @param ocspTimeout                         Timout in ms to use for OCSP requests
+     * @param ocspVerifyFlags                     Verification flags for OCSP
      */
     OpenSSLEngine(Cleaner cleaner, MemorySegment sslCtx, String fallbackApplicationProtocol, boolean clientMode,
             OpenSSLSessionContext sessionContext, boolean alpn, boolean initialized, int certificateVerificationDepth,
-            boolean certificateVerificationOptionalNoCA, boolean noOcspCheck) {
+            boolean certificateVerificationOptionalNoCA, boolean noOcspCheck, boolean ocspSoftFail, int ocspTimeout,
+            int ocspVerifyFlags) {
         if (sslCtx == null) {
             throw new IllegalArgumentException(sm.getString("engine.noSSLContext"));
         }
@@ -200,7 +209,8 @@ public final class OpenSSLEngine extends SSLEngine implements SSLUtil.ProtocolIn
             var internalBIO = internalBIOPointer.get(ValueLayout.ADDRESS, 0);
             var networkBIO = networkBIOPointer.get(ValueLayout.ADDRESS, 0);
             SSL_set_bio(ssl, internalBIO, internalBIO);
-            state = new EngineState(ssl, networkBIO, certificateVerificationDepth, noOcspCheck);
+            state = new EngineState(ssl, networkBIO, certificateVerificationDepth, noOcspCheck, ocspSoftFail,
+                    ocspTimeout, ocspVerifyFlags);
         }
         this.fallbackApplicationProtocol = fallbackApplicationProtocol;
         this.clientMode = clientMode;
@@ -403,7 +413,7 @@ public final class OpenSSLEngine extends SSLEngine implements SSLUtil.ProtocolIn
                 }
 
                 if (bytesWritten == 0) {
-                    throw new IllegalStateException(sm.getString("engine.failedToWriteBytes"));
+                    throw new SSLException(sm.getString("engine.failedToWriteBytes"));
                 }
 
                 // Check to see if the engine wrote data into the network BIO
@@ -531,7 +541,7 @@ public final class OpenSSLEngine extends SSLEngine implements SSLUtil.ProtocolIn
                 if (bytesRead == 0) {
                     // This should not be possible. pendingApp is positive
                     // therefore the read should have read at least one byte.
-                    throw new IllegalStateException(sm.getString("engine.failedToReadAvailableBytes"));
+                    throw new SSLException(sm.getString("engine.failedToReadAvailableBytes"));
                 }
 
                 bytesProduced += bytesRead;
@@ -730,9 +740,6 @@ public final class OpenSSLEngine extends SSLEngine implements SSLUtil.ProtocolIn
         if ((opts & SSL_OP_NO_TLSv1_3()) == 0) {
             enabled.add(Constants.SSL_PROTO_TLSv1_3);
         }
-        if ((opts & SSL_OP_NO_SSLv2()) == 0) {
-            enabled.add(Constants.SSL_PROTO_SSLv2);
-        }
         if ((opts & SSL_OP_NO_SSLv3()) == 0) {
             enabled.add(Constants.SSL_PROTO_SSLv3);
         }
@@ -752,7 +759,6 @@ public final class OpenSSLEngine extends SSLEngine implements SSLUtil.ProtocolIn
         if (destroyed) {
             return;
         }
-        boolean sslv2 = false;
         boolean sslv3 = false;
         boolean tlsv1 = false;
         boolean tlsv1_1 = false;
@@ -763,7 +769,6 @@ public final class OpenSSLEngine extends SSLEngine implements SSLUtil.ProtocolIn
                 throw new IllegalArgumentException(sm.getString("engine.unsupportedProtocol", p));
             }
             switch (p) {
-                case Constants.SSL_PROTO_SSLv2 -> sslv2 = true;
                 case Constants.SSL_PROTO_SSLv3 -> sslv3 = true;
                 case Constants.SSL_PROTO_TLSv1 -> tlsv1 = true;
                 case Constants.SSL_PROTO_TLSv1_1 -> tlsv1_1 = true;
@@ -773,10 +778,8 @@ public final class OpenSSLEngine extends SSLEngine implements SSLUtil.ProtocolIn
         }
         // Enable all and then disable what we not want
         openssl_h_Compatibility.SSL_set_options(state.ssl, SSL_OP_ALL());
-
-        if (!sslv2) {
-            openssl_h_Compatibility.SSL_set_options(state.ssl, SSL_OP_NO_SSLv2());
-        }
+        // Always disable SSLv2
+        openssl_h_Compatibility.SSL_set_options(state.ssl, SSL_OP_NO_SSLv2());
         if (!sslv3) {
             openssl_h_Compatibility.SSL_set_options(state.ssl, SSL_OP_NO_SSLv3());
         }
@@ -827,15 +830,23 @@ public final class OpenSSLEngine extends SSLEngine implements SSLUtil.ProtocolIn
 
     private byte[] getPeerCertificate() {
         try (var localArena = Arena.ofConfined()) {
-            MemorySegment/* (X509*) */ x509 = openssl_h_Compatibility.SSL_get_peer_certificate(state.ssl);
+            // Use the new SSL_get0_peer_certificate call for OpenSSL 3+ to avoid having to call free
+            MemorySegment/* (X509*) */ x509 =
+                    (openssl_h_Compatibility.OPENSSL3) ? SSL_get0_peer_certificate(state.ssl) :
+                            openssl_h_Compatibility.SSL_get_peer_certificate(state.ssl);
             MemorySegment bufPointer = localArena.allocateFrom(ValueLayout.ADDRESS, MemorySegment.NULL);
             int length = i2d_X509(x509, bufPointer);
             if (length <= 0) {
+                if (!openssl_h_Compatibility.OPENSSL3) {
+                    X509_free(x509);
+                }
                 return null;
             }
             MemorySegment buf = bufPointer.get(ValueLayout.ADDRESS, 0);
             byte[] certificate = buf.reinterpret(length, localArena, null).toArray(ValueLayout.JAVA_BYTE);
-            X509_free(x509);
+            if (!openssl_h_Compatibility.OPENSSL3) {
+                X509_free(x509);
+            }
             OPENSSL_free(buf);
             return certificate;
         }
@@ -1134,7 +1145,8 @@ public final class OpenSSLEngine extends SSLEngine implements SSLUtil.ProtocolIn
                     (errnum == X509_V_ERR_SELF_SIGNED_CERT_IN_CHAIN()) ||
                     (errnum == X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY()) ||
                     (errnum == X509_V_ERR_CERT_UNTRUSTED()) || (errnum == X509_V_ERR_UNABLE_TO_VERIFY_LEAF_SIGNATURE());
-            if (verifyErrorIsOptional && (state.certificateVerifyMode == OpenSSLContext.OPTIONAL_NO_CA)) {
+            if ((verifyErrorIsOptional || errnum == X509_V_OK()) &&
+                    (state.certificateVerifyMode == OpenSSLContext.OPTIONAL_NO_CA)) {
                 ok = 1;
                 openssl_h_Compatibility.SSL_set_verify_result(state.ssl, X509_V_OK());
             }
@@ -1161,20 +1173,18 @@ public final class OpenSSLEngine extends SSLEngine implements SSLUtil.ProtocolIn
                  * issuer may be missing/untrusted. Fail in that case.
                  */
                 if (verifyErrorIsOptional) {
-                    if (state.certificateVerifyMode != OpenSSLContext.OPTIONAL_NO_CA) {
-                        X509_STORE_CTX_set_error(x509ctx, X509_V_ERR_APPLICATION_VERIFICATION());
-                        errnum = X509_V_ERR_APPLICATION_VERIFICATION();
-                        ok = 0;
-                    }
+                    X509_STORE_CTX_set_error(x509ctx, X509_V_ERR_APPLICATION_VERIFICATION());
+                    errnum = X509_V_ERR_APPLICATION_VERIFICATION();
+                    ok = 0;
                 } else {
-                    int ocspResponse = processOCSP(x509ctx);
+                    int ocspResponse = processOCSP(state, x509ctx);
                     if (ocspResponse == V_OCSP_CERTSTATUS_REVOKED()) {
                         ok = 0;
                         errnum = X509_STORE_CTX_get_error(x509ctx);
                         X509_STORE_CTX_set_error(x509ctx, X509_V_ERR_CERT_REVOKED());
                     } else if (ocspResponse == V_OCSP_CERTSTATUS_UNKNOWN()) {
                         errnum = X509_STORE_CTX_get_error(x509ctx);
-                        if (errnum != X509_V_ERR_UNABLE_TO_GET_CRL() && (errnum == X509_V_ERR_APPLICATION_VERIFICATION() || errnum != 0)) {
+                        if (errnum != 0 && !(state.ocspSoftFail && errnum == X509_V_ERR_UNABLE_TO_GET_CRL())) {
                             ok = 0;
                         }
                     }
@@ -1189,7 +1199,7 @@ public final class OpenSSLEngine extends SSLEngine implements SSLUtil.ProtocolIn
         }
     }
 
-    private static int processOCSP(MemorySegment /* X509_STORE_CTX */ x509ctx) {
+    private static int processOCSP(EngineState state, MemorySegment /* X509_STORE_CTX */ x509ctx) {
         int ocspResponse = V_OCSP_CERTSTATUS_UNKNOWN();
         MemorySegment x509 = X509_STORE_CTX_get_current_cert(x509ctx);
         if (!MemorySegment.NULL.equals(x509)) {
@@ -1207,7 +1217,8 @@ public final class OpenSSLEngine extends SSLEngine implements SSLUtil.ProtocolIn
                         if (openssl_h_Compatibility.OPENSSL && !openssl_h_Compatibility.OPENSSL3) {
                             issuer = openssl_h_Compatibility.X509_STORE_CTX_get0_current_issuer(x509ctx);
                         } else {
-                            MemorySegment x509IssuerPointer = localArena.allocateFrom(ValueLayout.ADDRESS, MemorySegment.NULL);
+                            MemorySegment x509IssuerPointer =
+                                    localArena.allocateFrom(ValueLayout.ADDRESS, MemorySegment.NULL);
                             int res = X509_STORE_CTX_get1_issuer(x509IssuerPointer, x509ctx, x509);
                             if (res > 0) {
                                 issuer = x509IssuerPointer.get(ValueLayout.ADDRESS, 0);
@@ -1237,7 +1248,8 @@ public final class OpenSSLEngine extends SSLEngine implements SSLUtil.ProtocolIn
                                     for (String urlString : urls) {
                                         try {
                                             URL url = (new URI(urlString)).toURL();
-                                            ocspResponse = processOCSPRequest(url, issuer, x509, x509ctx, localArena);
+                                            ocspResponse =
+                                                    processOCSPRequest(state, url, issuer, x509, x509ctx, localArena);
                                             if (log.isDebugEnabled()) {
                                                 log.debug(sm.getString("engine.ocspResponse", urlString,
                                                         Integer.toString(ocspResponse)));
@@ -1290,9 +1302,10 @@ public final class OpenSSLEngine extends SSLEngine implements SSLUtil.ProtocolIn
         }
     }
 
-    private static int processOCSPRequest(URL url, MemorySegment issuer, MemorySegment x509,
+    private static int processOCSPRequest(EngineState state, URL url, MemorySegment issuer, MemorySegment x509,
             MemorySegment /* X509_STORE_CTX */ x509ctx, Arena localArena) {
-        if (openssl_h_Compatibility.BORINGSSL) {
+        if (openssl_h_Compatibility.BORINGSSL || openssl_h_Compatibility.isLibreSSLPre35()) {
+            X509_STORE_CTX_set_error(x509ctx, X509_V_ERR_UNABLE_TO_GET_CRL());
             return V_OCSP_CERTSTATUS_UNKNOWN();
         }
         MemorySegment ocspRequest = MemorySegment.NULL;
@@ -1305,19 +1318,24 @@ public final class OpenSSLEngine extends SSLEngine implements SSLUtil.ProtocolIn
         try (ByteArrayOutputStream baos = new ByteArrayOutputStream()) {
             ocspRequest = OCSP_REQUEST_new();
             if (MemorySegment.NULL.equals(ocspRequest)) {
+                X509_STORE_CTX_set_error(x509ctx, X509_V_ERR_UNABLE_TO_GET_CRL());
                 return V_OCSP_CERTSTATUS_UNKNOWN();
             }
             id = OCSP_cert_to_id(MemorySegment.NULL, x509, issuer);
             if (MemorySegment.NULL.equals(id)) {
+                X509_STORE_CTX_set_error(x509ctx, X509_V_ERR_UNABLE_TO_GET_CRL());
                 return V_OCSP_CERTSTATUS_UNKNOWN();
             }
             ocspOneReq = OCSP_request_add0_id(ocspRequest, id);
             if (MemorySegment.NULL.equals(ocspOneReq)) {
+                X509_STORE_CTX_set_error(x509ctx, X509_V_ERR_UNABLE_TO_GET_CRL());
                 return V_OCSP_CERTSTATUS_UNKNOWN();
             }
+            OCSP_request_add1_nonce(ocspRequest, (char) 0, -1);
             MemorySegment bufPointer = localArena.allocateFrom(ValueLayout.ADDRESS, MemorySegment.NULL);
             int requestLength = i2d_OCSP_REQUEST(ocspRequest, bufPointer);
             if (requestLength <= 0) {
+                X509_STORE_CTX_set_error(x509ctx, X509_V_ERR_UNABLE_TO_GET_CRL());
                 return V_OCSP_CERTSTATUS_UNKNOWN();
             }
             MemorySegment buf = bufPointer.get(ValueLayout.ADDRESS, 0);
@@ -1328,6 +1346,8 @@ public final class OpenSSLEngine extends SSLEngine implements SSLUtil.ProtocolIn
             // Content-Length: ocspRequestData.length
             byte[] ocspRequestData = buf.reinterpret(requestLength, localArena, null).toArray(ValueLayout.JAVA_BYTE);
             connection = (HttpURLConnection) url.openConnection();
+            connection.setConnectTimeout(state.ocspTimeout);
+            connection.setReadTimeout(state.ocspTimeout);
             connection.setRequestMethod(Method.POST);
             connection.setDoInput(true);
             connection.setDoOutput(true);
@@ -1337,39 +1357,74 @@ public final class OpenSSLEngine extends SSLEngine implements SSLUtil.ProtocolIn
             connection.getOutputStream().write(ocspRequestData);
             int responseCode = connection.getResponseCode();
             if (responseCode != HttpURLConnection.HTTP_OK) {
+                X509_STORE_CTX_set_error(x509ctx, X509_V_ERR_UNABLE_TO_GET_CRL());
                 return V_OCSP_CERTSTATUS_UNKNOWN();
             }
             InputStream is = connection.getInputStream();
             int read;
             byte[] responseBuf = new byte[1024];
             while ((read = is.read(responseBuf)) > 0) {
+                if (baos.size() > OCSP_MAX_RESPONSE_SIZE) {
+                    X509_STORE_CTX_set_error(x509ctx, X509_V_ERR_UNABLE_TO_GET_CRL());
+                    return V_OCSP_CERTSTATUS_UNKNOWN();
+                }
                 baos.write(responseBuf, 0, read);
             }
             byte[] responseData = baos.toByteArray();
             var nativeResponseData = localArena.allocateFrom(ValueLayout.JAVA_BYTE, responseData);
             var nativeResponseDataPointer = localArena.allocateFrom(ValueLayout.ADDRESS, nativeResponseData);
             ocspResponse = d2i_OCSP_RESPONSE(MemorySegment.NULL, nativeResponseDataPointer, responseData.length);
-            if (!MemorySegment.NULL.equals(ocspResponse)) {
+            if (MemorySegment.NULL.equals(ocspResponse)) {
+                // Failed to get a valid response
+                X509_STORE_CTX_set_error(x509ctx, X509_V_ERR_APPLICATION_VERIFICATION());
+            } else {
                 if (OCSP_response_status(ocspResponse) == OCSP_RESPONSE_STATUS_SUCCESSFUL()) {
                     basicResponse = OCSP_response_get1_basic(ocspResponse);
+                    if (OCSP_check_nonce(ocspRequest, basicResponse) == 0) {
+                        X509_STORE_CTX_set_error(x509ctx, X509_V_ERR_OCSP_RESP_INVALID());
+                        return V_OCSP_CERTSTATUS_UNKNOWN();
+                    }
+                    MemorySegment certStack = OCSP_resp_get0_certs(basicResponse);
+                    if (OCSP_basic_verify(basicResponse, certStack, X509_STORE_CTX_get0_store(x509ctx),
+                            state.ocspVerifyFlags) <= 0) {
+                        X509_STORE_CTX_set_error(x509ctx, X509_V_ERR_OCSP_SIGNATURE_FAILURE());
+                        return V_OCSP_CERTSTATUS_UNKNOWN();
+                    }
                     certId = OCSP_cert_to_id(MemorySegment.NULL, x509, issuer);
                     if (MemorySegment.NULL.equals(certId)) {
+                        X509_STORE_CTX_set_error(x509ctx, X509_V_ERR_OCSP_RESP_INVALID());
                         return V_OCSP_CERTSTATUS_UNKNOWN();
                     }
                     // Find by serial number and get the matching response
                     MemorySegment singleResponse =
                             OCSP_resp_get0(basicResponse, OCSP_resp_find(basicResponse, certId, -1));
-                    return OCSP_single_get0_status(singleResponse, MemorySegment.NULL, MemorySegment.NULL,
-                            MemorySegment.NULL, MemorySegment.NULL);
+                    MemorySegment thisUpdatePointer = localArena.allocateFrom(ValueLayout.ADDRESS, MemorySegment.NULL);
+                    MemorySegment nextUpdatePointer = localArena.allocateFrom(ValueLayout.ADDRESS, MemorySegment.NULL);
+                    int status = OCSP_single_get0_status(singleResponse, MemorySegment.NULL, MemorySegment.NULL,
+                            thisUpdatePointer, nextUpdatePointer);
+                    if (OCSP_check_validity(thisUpdatePointer.get(ValueLayout.ADDRESS, 0),
+                            nextUpdatePointer.get(ValueLayout.ADDRESS, 0), OCSP_MAX_SKEW, -1) <= 0) {
+                        X509_STORE_CTX_set_error(x509ctx, X509_V_ERR_OCSP_NOT_YET_VALID());
+                        return V_OCSP_CERTSTATUS_UNKNOWN();
+                    }
+                    if (OCSP_check_validity(thisUpdatePointer.get(ValueLayout.ADDRESS, 0),
+                            nextUpdatePointer.get(ValueLayout.ADDRESS, 0), OCSP_MAX_SKEW, OCSP_MAX_SKEW) <= 0) {
+                        X509_STORE_CTX_set_error(x509ctx, X509_V_ERR_OCSP_HAS_EXPIRED());
+                        return V_OCSP_CERTSTATUS_UNKNOWN();
+                    }
+                    return status;
+                } else {
+                    X509_STORE_CTX_set_error(x509ctx, X509_V_ERR_UNABLE_TO_GET_CRL());
                 }
             }
+        } catch (IOException ioe) {
+            // Timeout or network error. Responder is not available.
+            log.warn(sm.getString("engine.ocspRequestError", url.toString()), ioe);
+            X509_STORE_CTX_set_error(x509ctx, X509_V_ERR_UNABLE_TO_GET_CRL());
         } catch (Exception e) {
             log.warn(sm.getString("engine.ocspRequestError", url.toString()), e);
+            X509_STORE_CTX_set_error(x509ctx, X509_V_ERR_APPLICATION_VERIFICATION());
         } finally {
-            if (MemorySegment.NULL.equals(ocspResponse)) {
-                // Failed to get a valid response
-                X509_STORE_CTX_set_error(x509ctx, X509_V_ERR_APPLICATION_VERIFICATION());
-            }
             OCSP_CERTID_free(certId);
             OCSP_BASICRESP_free(basicResponse);
             OCSP_RESPONSE_free(ocspResponse);
@@ -1673,16 +1728,22 @@ public final class OpenSSLEngine extends SSLEngine implements SSLUtil.ProtocolIn
         private final MemorySegment networkBIO;
         private final int certificateVerificationDepth;
         private final boolean noOcspCheck;
+        private final boolean ocspSoftFail;
+        private final int ocspTimeout;
+        private final int ocspVerifyFlags;
 
         private PHAState phaState = PHAState.NONE;
         private int certificateVerifyMode = 0;
         private int handshakeCount = 0;
 
         private EngineState(MemorySegment ssl, MemorySegment networkBIO, int certificateVerificationDepth,
-                boolean noOcspCheck) {
+                boolean noOcspCheck, boolean ocspSoftFail, int ocspTimeout, int ocspVerifyFlags) {
             states.put(Long.valueOf(ssl.address()), this);
             this.certificateVerificationDepth = certificateVerificationDepth;
             this.noOcspCheck = noOcspCheck;
+            this.ocspSoftFail = ocspSoftFail;
+            this.ocspTimeout = ocspTimeout;
+            this.ocspVerifyFlags = ocspVerifyFlags;
             // Use another arena to avoid keeping a reference through segments
             // This also allows making further accesses to the main pointers safer
             this.ssl = ssl.reinterpret(ValueLayout.ADDRESS.byteSize(), stateArena, openssl_h::SSL_free);

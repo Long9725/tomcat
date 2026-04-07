@@ -32,10 +32,12 @@ import java.net.SocketAddress;
 import java.nio.CharBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
+import java.util.zip.Deflater;
 
 import jakarta.servlet.AsyncContext;
 import jakarta.servlet.DispatcherType;
@@ -47,6 +49,8 @@ import jakarta.servlet.http.HttpServlet;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 
+import org.apache.coyote.http11.filters.GzipOutputFilterFactory;
+import org.apache.coyote.http11.filters.OutputFilterFactory;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -421,7 +425,7 @@ public class TestHttp11Processor extends TomcatBaseTest {
         tomcat.start();
 
         ByteChunk responseBody = new ByteChunk();
-        Map<String, List<String>> responseHeaders = new HashMap<>();
+        Map<String,List<String>> responseHeaders = new HashMap<>();
         int rc = getUrl("http://localhost:" + getPort() + "/test", responseBody, responseHeaders);
 
         Assert.assertEquals(HttpServletResponse.SC_OK, rc);
@@ -445,7 +449,7 @@ public class TestHttp11Processor extends TomcatBaseTest {
         tomcat.start();
 
         ByteChunk responseBody = new ByteChunk();
-        Map<String, List<String>> responseHeaders = new HashMap<>();
+        Map<String,List<String>> responseHeaders = new HashMap<>();
         int rc = getUrl("http://localhost:" + getPort() + "/test", responseBody, responseHeaders);
 
         Assert.assertEquals(HttpServletResponse.SC_OK, rc);
@@ -854,11 +858,11 @@ public class TestHttp11Processor extends TomcatBaseTest {
         tomcat.start();
 
         ByteChunk getBody = new ByteChunk();
-        Map<String, List<String>> getHeaders = new HashMap<>();
+        Map<String,List<String>> getHeaders = new HashMap<>();
         int getStatus = getUrl("http://localhost:" + getPort() + "/test", getBody, getHeaders);
 
         ByteChunk headBody = new ByteChunk();
-        Map<String, List<String>> headHeaders = new HashMap<>();
+        Map<String,List<String>> headHeaders = new HashMap<>();
         int headStatus = getUrl("http://localhost:" + getPort() + "/test", headBody, headHeaders);
 
         Assert.assertEquals(HttpServletResponse.SC_OK, getStatus);
@@ -997,7 +1001,7 @@ public class TestHttp11Processor extends TomcatBaseTest {
         tomcat.start();
 
         ByteChunk responseBody = new ByteChunk();
-        Map<String, List<String>> responseHeaders = new HashMap<>();
+        Map<String,List<String>> responseHeaders = new HashMap<>();
         int rc = getUrl("http://localhost:" + getPort() + "/test", responseBody, responseHeaders);
 
         Assert.assertEquals(HttpServletResponse.SC_RESET_CONTENT, rc);
@@ -2148,7 +2152,44 @@ public class TestHttp11Processor extends TomcatBaseTest {
         Assert.assertEquals(HttpServletResponse.SC_OK, client.getStatusCode());
     }
 
+    @Test
+    public void testDefaultAutoRegistration() {
+        Http11NioProtocol protocol = new Http11NioProtocol();
 
+        // No factory configured - getOutputFilterFactories should auto-register GzipOutputFilterFactory
+        List<OutputFilterFactory> factories = protocol.getOutputFilterFactories();
+        Assert.assertFalse(factories.isEmpty());
+        Assert.assertEquals(1, factories.size());
+        Assert.assertTrue(factories.get(0) instanceof GzipOutputFilterFactory);
+    }
+
+    @Test
+    public void testAddOutputFilterFactory() {
+        Http11NioProtocol protocol = new Http11NioProtocol();
+
+        // Explicitly add a factory - should suppress default auto-registration
+        MockOutputFilterFactory mock = new MockOutputFilterFactory();
+        protocol.addOutputFilterFactory(mock);
+
+        List<OutputFilterFactory> factories = protocol.getOutputFilterFactories();
+        Assert.assertEquals(1, factories.size());
+        Assert.assertSame(mock, factories.get(0));
+    }
+
+    @Test
+    public void testAddMultipleOutputFilterFactories() {
+        Http11NioProtocol protocol = new Http11NioProtocol();
+
+        GzipOutputFilterFactory gzip = new GzipOutputFilterFactory();
+        MockOutputFilterFactory mock = new MockOutputFilterFactory();
+        protocol.addOutputFilterFactory(gzip);
+        protocol.addOutputFilterFactory(mock);
+
+        List<OutputFilterFactory> factories = protocol.getOutputFilterFactories();
+        Assert.assertEquals(2, factories.size());
+        Assert.assertSame(gzip, factories.get(0));
+        Assert.assertSame(mock, factories.get(1));
+    }
 
     private static class EarlyHintsServlet extends HttpServlet {
 
@@ -2165,6 +2206,7 @@ public class TestHttp11Processor extends TomcatBaseTest {
             this.useSendError = useSendError;
             this.errorString = errorString;
         }
+
         @Override
         protected void doGet(HttpServletRequest req, HttpServletResponse resp) throws ServletException, IOException {
             resp.addHeader("Link", "</style.css>; rel=preload; as=style");
@@ -2183,6 +2225,34 @@ public class TestHttp11Processor extends TomcatBaseTest {
             resp.setContentType("text/plain");
 
             resp.getWriter().write("OK");
+        }
+    }
+
+
+    @Test
+    public void testNoCompressionEncodings() {
+        Http11NioProtocol protocol = new Http11NioProtocol();
+        String encodings = protocol.getNoCompressionEncodings();
+        Assert.assertTrue(Arrays.asList("br", "compress", "dcb", "dcz", "deflate", "gzip", "pack200-gzip", "zstd")
+                .stream().anyMatch(encodings::contains));
+
+        protocol.setNoCompressionEncodings("br");
+
+        String newEncodings = protocol.getNoCompressionEncodings();
+        Assert.assertTrue(newEncodings.contains("br"));
+        Assert.assertFalse(newEncodings.contains("gzip"));
+    }
+
+    public static class MockOutputFilterFactory implements OutputFilterFactory {
+
+        @Override
+        public OutputFilter createFilter() {
+            return null;
+        }
+
+        @Override
+        public String getEncodingName() {
+            return "mock";
         }
     }
 }

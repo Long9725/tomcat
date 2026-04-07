@@ -15,29 +15,26 @@
  * limitations under the License.
  */
 
-package org.apache.tomcat.security;
-
-import javax.net.ssl.SSLHandshakeException;
+package org.apache.catalina.authenticator;
 
 import org.junit.Assert;
 import org.junit.Test;
 
+import org.apache.catalina.startup.Tomcat;
 import org.apache.catalina.startup.TomcatBaseTest;
-import org.apache.tomcat.util.net.ocsp.TestOcspIntegration;
+import org.apache.tomcat.util.net.TesterSupport;
 
-public class TestSecurity2017 extends TomcatBaseTest {
-    /*
-     * https://www.cve.org/CVERecord?id=CVE-2017-15698
-     *
-     * Fixed in Tomcat Native
-     * 1.2.16  https://github.com/apache/tomcat-native/commit/4582e6d9223da618b42db6e992bb2d55d9cd4c42
-     */
+public class TestSSLAuthenticator extends TomcatBaseTest {
+
+    // https://bz.apache.org/bugzilla/show_bug.cgi?id=65991
     @Test
-    public void testCVE_2017_15698() throws Exception {
-        try {
-            TestOcspIntegration.testLongUrlForOcspViaAIAWithTomcatNative(getTomcatInstance());
-        } catch (SSLHandshakeException sslHandshakeException) {
-            Assert.assertTrue(sslHandshakeException.toString().contains("certificate_revoked"));
-        }
+    public void testBindOnInitFalseNoNPE() throws Exception {
+        Tomcat tomcat = getTomcatInstance();
+
+        TesterSupport.configureClientCertContext(tomcat);
+        Assert.assertTrue(tomcat.getConnector().setProperty("bindOnInit", "false"));
+
+        tomcat.start();
+        tomcat.stop();
     }
 }

@@ -1254,6 +1254,7 @@ public class NioEndpoint extends AbstractNetworkChannelEndpoint<NioChannel,Socke
                     getSocket().close(true);
                 }
                 if (getEndpoint().running) {
+                    getSocket().reset(null, null);
                     if (nioChannels == null || !nioChannels.push(getSocket())) {
                         getSocket().free();
                     }
@@ -1376,6 +1377,28 @@ public class NioEndpoint extends AbstractNetworkChannelEndpoint<NioChannel,Socke
          */
         private boolean socketOrNetworkBufferHasDataLeft() {
             return !socketBufferHandler.isWriteBufferEmpty() || getSocket().getOutboundRemaining() > 0;
+        }
+
+
+        /*
+         * https://bz.apache.org/bugzilla/show_bug.cgi?id=69982
+         *
+         * Similar to socketOrNetworkBufferHasDataLeft(), check the additional buffer for TLS.
+         */
+        @Override
+        public boolean hasDataToWrite() {
+            return super.hasDataToWrite() || getSocket().getOutboundRemaining() > 0;
+        }
+
+
+        /*
+         * https://bz.apache.org/bugzilla/show_bug.cgi?id=69982
+         *
+         * Similar to socketOrNetworkBufferHasDataLeft(), check the additional buffer for TLS.
+         */
+        @Override
+        public boolean canWrite() {
+            return super.canWrite() && getSocket().getOutboundRemaining() == 0;
         }
 
 

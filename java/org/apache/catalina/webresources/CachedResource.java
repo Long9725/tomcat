@@ -576,6 +576,7 @@ public class CachedResource implements WebResource {
 
         @Override
         @Deprecated
+        @SuppressWarnings("removal")
         public Permission getPermission() throws IOException {
             // Doesn't trigger a call to connect for file:// URLs
             return resourceURL.openConnection().getPermission();
@@ -639,6 +640,7 @@ public class CachedResource implements WebResource {
 
         @Override
         @Deprecated
+        @SuppressWarnings("removal")
         public Permission getPermission() throws IOException {
             // Doesn't trigger a call to connect for jar:// URLs
             return resourceURL.openConnection().getPermission();
@@ -663,5 +665,10 @@ public class CachedResource implements WebResource {
             return ((JarURLConnection) resourceURL.openConnection()).getJarFile();
         }
 
+        @Override
+        public String getContentType() {
+            // "content/unknown" is the value used by sun.net.www.URLConnection. It is used here for consistency.
+            return Objects.requireNonNullElse(getResource().getMimeType(), "content/unknown");
+        }
     }
 }

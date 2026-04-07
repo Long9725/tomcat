@@ -102,8 +102,18 @@ public class OpenSSLContext implements org.apache.tomcat.util.net.SSLContext {
         boolean success = false;
         try {
             // Create OpenSSLConfCmd context if used
-            OpenSSLConf openSslConf = sslHostConfig.getOpenSslConf();
-            if (openSslConf != null) {
+            if (sslHostConfig.getOpenSslConf() == null && sslHostConfig.getTrustManagerClassName() == null &&
+                    sslHostConfig.getTruststore() == null) {
+                /*
+                 * If an instance of OpenSSLConf is required, it must be created here so the reference can be placed in
+                 * the (immutable) OpenSSLState record.
+                 *
+                 * If OpenSSL managed trust is used, an instance of OpenSSLConf is required to pass OCSP configuration
+                 * parameters to Tomcat Native. Create one if one hasn't already been created.
+                 */
+                sslHostConfig.setOpenSslConf(new OpenSSLConf());
+            }
+            if (sslHostConfig.getOpenSslConf() != null) {
                 try {
                     if (log.isTraceEnabled()) {
                         log.trace(sm.getString("openssl.makeConf"));
@@ -121,8 +131,6 @@ public class OpenSSLContext implements org.apache.tomcat.util.net.SSLContext {
             for (String protocol : sslHostConfig.getEnabledProtocols()) {
                 if (Constants.SSL_PROTO_SSLv2Hello.equalsIgnoreCase(protocol)) {
                     // NO-OP. OpenSSL always supports SSLv2Hello
-                } else if (Constants.SSL_PROTO_SSLv2.equalsIgnoreCase(protocol)) {
-                    value |= SSL.SSL_PROTOCOL_SSLV2;
                 } else if (Constants.SSL_PROTO_SSLv3.equalsIgnoreCase(protocol)) {
                     value |= SSL.SSL_PROTOCOL_SSLV3;
                 } else if (Constants.SSL_PROTO_TLSv1.equalsIgnoreCase(protocol)) {
@@ -316,8 +324,9 @@ public class OpenSSLContext implements org.apache.tomcat.util.net.SSLContext {
                 SSLContext.clearOptions(state.ctx, SSL.SSL_OP_NO_TICKET);
             }
 
-            // List the ciphers that the client is permitted to negotiate
+            // Configure the ciphers that the client is permitted to negotiate
             SSLContext.setCipherSuite(state.ctx, sslHostConfig.getCiphers());
+            SSLContext.setCipherSuitesEx(state.ctx, sslHostConfig.getCipherSuites());
 
             // If there is no certificate file must be using a KeyStore so a KeyManager is required.
             // If there is a certificate file a KeyManager is helpful but not strictly necessary.
@@ -354,6 +363,14 @@ public class OpenSSLContext implements org.apache.tomcat.util.net.SSLContext {
                 SSLContext.setCACertificate(state.ctx,
                         SSLHostConfig.adjustRelativePath(sslHostConfig.getCaCertificateFile()),
                         SSLHostConfig.adjustRelativePath(sslHostConfig.getCaCertificatePath()));
+                sslHostConfig.getOpenSslConf().addCmd(new OpenSSLConfCmd(OpenSSLConfCmd.NO_OCSP_CHECK,
+                        Boolean.toString(!sslHostConfig.getOcspEnabled())));
+                sslHostConfig.getOpenSslConf().addCmd(new OpenSSLConfCmd(OpenSSLConfCmd.OCSP_SOFT_FAIL,
+                        Boolean.toString(sslHostConfig.getOcspSoftFail())));
+                sslHostConfig.getOpenSslConf().addCmd(new OpenSSLConfCmd(OpenSSLConfCmd.OCSP_TIMEOUT,
+                        Integer.toString(sslHostConfig.getOcspTimeout())));
+                sslHostConfig.getOpenSslConf().addCmd(new OpenSSLConfCmd(OpenSSLConfCmd.OCSP_VERIFY_FLAGS,
+                        Integer.toString(sslHostConfig.getOcspVerifyFlags())));
             }
 
             if (negotiableProtocols != null && !negotiableProtocols.isEmpty()) {
@@ -403,9 +420,6 @@ public class OpenSSLContext implements org.apache.tomcat.util.net.SSLContext {
                 }
                 if ((opts & SSL.SSL_OP_NO_TLSv1_2) == 0) {
                     enabled.add(Constants.SSL_PROTO_TLSv1_2);
-                }
-                if ((opts & SSL.SSL_OP_NO_SSLv2) == 0) {
-                    enabled.add(Constants.SSL_PROTO_SSLv2);
                 }
                 if ((opts & SSL.SSL_OP_NO_SSLv3) == 0) {
                     enabled.add(Constants.SSL_PROTO_SSLv3);

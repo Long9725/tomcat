@@ -30,6 +30,7 @@ import org.apache.coyote.Response;
 import org.apache.coyote.UpgradeProtocol;
 import org.apache.coyote.UpgradeToken;
 import org.apache.coyote.http11.AbstractHttp11Protocol;
+import org.apache.coyote.http11.filters.OutputFilterFactory;
 import org.apache.coyote.http11.upgrade.InternalHttpUpgradeHandler;
 import org.apache.coyote.http11.upgrade.UpgradeProcessorInternal;
 import org.apache.juli.logging.Log;
@@ -111,6 +112,19 @@ public class Http2Protocol implements UpgradeProtocol {
      */
     private boolean discardRequestsAndResponses = false;
     private final SynchronizedStack<Request> recycledRequestsAndResponses = new SynchronizedStack<>();
+
+    /*
+     * Additional time in nanoseconds between sending the first graceful GOAWAY (max stream id) and the final GOAWAY
+     * (last seen stream id). During this time the server will continue to process new streams on the connection. This
+     * is to mitigate the race of client-buffered/sent packets for new streams and the final GOAWAY (with last seen
+     * stream id). By default, Tomcat uses the last computed RTT for this interval, but the RTT might have fluctuated
+     * due to network or server load conditions, or the client (e.g. nghttp2) might have already buffered frames for
+     * opening new streams on a connection.
+     *
+     * The name "drainTimeout" is taken from Envoy proxy's identical HTTP Connection Manager property and means exactly
+     * the same.
+     */
+    private long drainTimeout;
 
     @Override
     public String getHttpUpgradeName(boolean isSSLEnabled) {
@@ -353,7 +367,7 @@ public class Http2Protocol implements UpgradeProtocol {
     }
 
 
-    public boolean useCompression(Request request, Response response) {
+    public OutputFilterFactory useCompression(Request request, Response response) {
         return http11Protocol.useCompression(request, response);
     }
 
@@ -406,6 +420,16 @@ public class Http2Protocol implements UpgradeProtocol {
 
     public void setDiscardRequestsAndResponses(boolean discardRequestsAndResponses) {
         this.discardRequestsAndResponses = discardRequestsAndResponses;
+    }
+
+
+    public long getDrainTimeout() {
+        return drainTimeout;
+    }
+
+
+    public void setDrainTimeout(long drainTimeout) {
+        this.drainTimeout = drainTimeout;
     }
 
 

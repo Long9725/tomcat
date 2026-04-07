@@ -39,7 +39,9 @@ import org.apache.coyote.NonPipeliningProcessor;
 import org.apache.coyote.Request;
 import org.apache.coyote.RequestGroupInfo;
 import org.apache.coyote.Response;
+import org.apache.coyote.http11.AbstractHttp11Protocol;
 import org.apache.coyote.http11.filters.GzipOutputFilter;
+import org.apache.coyote.http11.filters.OutputFilterFactory;
 import org.apache.juli.logging.Log;
 import org.apache.juli.logging.LogFactory;
 import org.apache.tomcat.util.buf.ByteChunk;
@@ -208,10 +210,14 @@ class StreamProcessor extends AbstractProcessor implements NonPipeliningProcesso
         // Compression can't be used with sendfile
         // Need to check for compression (and set headers appropriately) before
         // adding headers below
-        if (noSendfile && protocol != null && protocol.useCompression(coyoteRequest, coyoteResponse)) {
+        if (noSendfile && protocol != null) {
             // Enable compression. Headers will have been set. Need to configure
             // output filter at this point.
-            stream.addOutputFilter(new GzipOutputFilter());
+            OutputFilterFactory factory = protocol.useCompression(coyoteRequest, coyoteResponse);
+
+            if (factory != null) {
+                stream.addOutputFilter(factory.createFilter());
+            }
         }
 
         // Check to see if a response body is present
@@ -502,7 +508,14 @@ class StreamProcessor extends AbstractProcessor implements NonPipeliningProcesso
      * The checks performed below are based on the checks in Http11InputBuffer.
      */
     private boolean validateRequest() {
-        HttpParser httpParser = handler.getProtocol().getHttp11Protocol().getHttpParser();
+        // Check for issues during header processing. Include:
+        // - invalid (incorrectly formatted) :authority header
+        // - invalid (incorrectly formatted) host header
+        if (request.getNote(Request.NOTE_BAD_REQUEST) != null) {
+            // Notes not reset when request is recycled
+            request.setNote(Request.NOTE_BAD_REQUEST, null);
+            return false;
+        }
 
         // Method name must be a token
         if (!HttpParser.isToken(request.getMethod())) {
@@ -514,6 +527,8 @@ class StreamProcessor extends AbstractProcessor implements NonPipeliningProcesso
         if (!HttpParser.isScheme(scheme)) {
             return false;
         }
+
+        HttpParser httpParser = handler.getProtocol().getHttp11Protocol().getHttpParser();
 
         // Invalid character in request target
         // (other checks such as valid %nn happen later)
